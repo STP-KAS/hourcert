@@ -1,0 +1,251 @@
+// hourcert: hourly energy-attribute certificates that are issued once per
+// meter-hour, owned by one holder at a time, retired against one claim and
+// voidable by an auditor with the reason on the record.
+//
+// Roles:
+//   issuer   - the issuing body (registry operator). Co-signs every issuance
+//              and can close a device lineage.
+//   meter    - the metering attester of one facility. Signs one reading per
+//              hour, in the oneword statement format:
+//                statement = blake2b(meter_domain || hour (8 bytes LE) || body)
+//                body      = blake2b(registry || device || wh (8 bytes LE))
+//              If the same meter key backs a oneword bond with meter_domain,
+//              signing a second reading for an hour (a different amount, or
+//              the same hour sold into another registry) is a oneword
+//              equivocation: anyone can slash that bond.
+//   holder   - owns a certificate: transfer, split, retire against a claim.
+//   auditor  - voids a live or retired certificate, with a reason hash.
+//   anyone   - nothing else; there is no keyless path.
+//
+// State machine:
+//   Device --issue--> Device + Cert
+//   Cert --transfer--> Cert, --split--> Cert + Cert, --retire--> Retired,
+//        --invalidate--> Void
+//   Retired --invalidate--> Void, --archive (after archive_after DAA)--> gone
+//   Void --archive (after archive_after DAA, auditor)--> gone
+//   Device --close (issuer)--> gone
+
+const byte[32] NO_CLAIM = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+
+state DeviceState {
+    pubkey issuer;
+    pubkey meter;
+    pubkey auditor;
+    byte[32] meter_domain;
+    byte[32] registry;
+    byte[32] device;
+    int last_hour;
+    int max_wh;
+    int archive_after;
+}
+
+state CertState {
+    pubkey auditor;
+    byte[32] registry;
+    byte[32] device;
+    int hour;
+    int wh;
+    pubkey holder;
+    int archive_after;
+}
+
+state RetiredState {
+    pubkey auditor;
+    byte[32] registry;
+    byte[32] device;
+    int hour;
+    int wh;
+    pubkey holder;
+    int archive_after;
+    byte[32] claim;
+}
+
+state VoidState {
+    pubkey auditor;
+    byte[32] registry;
+    byte[32] device;
+    int hour;
+    int wh;
+    pubkey holder;
+    int archive_after;
+    byte[32] claim;
+    byte[32] reason;
+}
+
+fn reading_statement(byte[32] meter_domain, byte[8] hour, byte[32] registry, byte[32] device, byte[8] wh) -> byte[32] {
+    byte[32] body = blake2b(byte[](registry + device + wh));
+    return blake2b(byte[](meter_domain + hour + body));
+}
+
+actor Device owns DeviceState {
+    entry issue(byte[8] hour_le, byte[8] wh_le, datasig meter_sig, sig issuer_sig, pubkey holder) emits {
+        device: Device,
+        cert: Cert,
+    } {
+        int hour = int(hour_le);
+        int wh = int(wh_le);
+        // One certificate per meter-hour in this lineage: hours only go up.
+        require(hour > last_hour);
+        require(wh > 0);
+        // Nameplate cap: no hour can claim more than the facility can make.
+        require(wh <= max_wh);
+        require(checkMsgSig(meter_sig, reading_statement(meter_domain, hour_le, registry, device, wh_le), meter));
+        require(checkSig(issuer_sig, issuer));
+
+        DeviceState next_device = {
+            issuer: issuer,
+            meter: meter,
+            auditor: auditor,
+            meter_domain: meter_domain,
+            registry: registry,
+            device: device,
+            last_hour: hour,
+            max_wh: max_wh,
+            archive_after: archive_after,
+        };
+        CertState issued = {
+            auditor: auditor,
+            registry: registry,
+            device: device,
+            hour: hour,
+            wh: wh,
+            holder: holder,
+            archive_after: archive_after,
+        };
+        require(device.value == self.value);
+        unrestricted(cert.value);
+        become {
+            device <- Device(next_device),
+            cert <- Cert(issued),
+        };
+    }
+
+    entry close(sig issuer_sig) emits none {
+        require(checkSig(issuer_sig, issuer));
+    }
+}
+
+actor Cert owns CertState {
+    entry transfer(sig holder_sig, pubkey new_holder) emits next: Cert {
+        require(checkSig(holder_sig, holder));
+        CertState moved = {
+            auditor: auditor,
+            registry: registry,
+            device: device,
+            hour: hour,
+            wh: wh,
+            holder: new_holder,
+            archive_after: archive_after,
+        };
+        require(next.value == self.value);
+        become next <- Cert(moved);
+    }
+
+    // Partial transfer: `take` Wh go to new_holder, the rest stays.
+    entry split(sig holder_sig, int take, pubkey new_holder) emits {
+        keep: Cert,
+        part: Cert,
+    } {
+        require(checkSig(holder_sig, holder));
+        require(take > 0);
+        require(take < wh);
+        CertState kept = {
+            auditor: auditor,
+            registry: registry,
+            device: device,
+            hour: hour,
+            wh: wh - take,
+            holder: holder,
+            archive_after: archive_after,
+        };
+        CertState given = {
+            auditor: auditor,
+            registry: registry,
+            device: device,
+            hour: hour,
+            wh: take,
+            holder: new_holder,
+            archive_after: archive_after,
+        };
+        require(keep.value == self.value);
+        unrestricted(part.value);
+        become {
+            keep <- Cert(kept),
+            part <- Cert(given),
+        };
+    }
+
+    // One claim: who, for what consumption and reporting period (a hash).
+    entry retire(sig holder_sig, byte[32] claim) emits next: Retired {
+        require(checkSig(holder_sig, holder));
+        RetiredState done = {
+            auditor: auditor,
+            registry: registry,
+            device: device,
+            hour: hour,
+            wh: wh,
+            holder: holder,
+            archive_after: archive_after,
+            claim: claim,
+        };
+        require(next.value == self.value);
+        become next <- Retired(done);
+    }
+
+    entry invalidate(sig auditor_sig, byte[32] reason) emits next: Void {
+        require(checkSig(auditor_sig, auditor));
+        VoidState voided = {
+            auditor: auditor,
+            registry: registry,
+            device: device,
+            hour: hour,
+            wh: wh,
+            holder: holder,
+            archive_after: archive_after,
+            claim: NO_CLAIM,
+            reason: reason,
+        };
+        require(next.value == self.value);
+        become next <- Void(voided);
+    }
+}
+
+actor Retired owns RetiredState {
+    entry invalidate(sig auditor_sig, byte[32] reason) emits next: Void {
+        require(checkSig(auditor_sig, auditor));
+        VoidState voided = {
+            auditor: auditor,
+            registry: registry,
+            device: device,
+            hour: hour,
+            wh: wh,
+            holder: holder,
+            archive_after: archive_after,
+            claim: claim,
+            reason: reason,
+        };
+        require(next.value == self.value);
+        become next <- Void(voided);
+    }
+
+    // After the challenge window the holder takes the deposit back. The
+    // retirement stays in the chain history; the live UTXO is gone.
+    entry archive(sig holder_sig) emits none {
+        require(this.ageDaa >= archive_after);
+        require(checkSig(holder_sig, holder));
+    }
+}
+
+actor Void owns VoidState {
+    entry archive(sig auditor_sig) emits none {
+        require(this.ageDaa >= archive_after);
+        require(checkSig(auditor_sig, auditor));
+    }
+}
+
+app HourCert {
+    actor Device;
+    actor Cert;
+    actor Retired;
+    actor Void;
+}
